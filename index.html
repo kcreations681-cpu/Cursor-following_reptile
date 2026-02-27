@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sci-Fi Procedural Reptile</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a0f; overflow: hidden; display: flex; align-items: center; justify-content: center; height: 100vh; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+<script>
+new p5(function(p) {
+  // ─── CONFIG ─────────────────────────────────────────────────────────────────
+  const NUM_SEGMENTS = 18;
+  const SEG_LEN = 22;
+  const NUM_LEGS = 8;            // 4 pairs
+  const STEP_DIST = 55;          // how far before a foot re-anchors
+  const STEP_SPEED = 0.18;       // lerp speed for stepping foot
+  const BODY_FOLLOW = 0.12;
+  const SLITHER_AMP = 6;
+  const SLITHER_FREQ = 0.25;
+  const SLITHER_SPEED = 0.04;
+
+  // ─── STATE ──────────────────────────────────────────────────────────────────
+  let head = { x: 400, y: 300 };
+  let target = { x: 400, y: 300 };
+  let segments = [];
+  let feet = [];          // [{anchor, current, target, stepping, side, segIdx}]
+  let slitherT = 0;
+  let circleAngle = 0;
+  let mouseIdle = 0;
+  let lastMouse = { x: -999, y: -999 };
+  let glowPulse = 0;
+
+  // ─── SETUP ──────────────────────────────────────────────────────────────────
+  p.setup = function() {
+    p.createCanvas(p.windowWidth, p.windowHeight);
+    p.colorMode(p.RGB, 255);
+
+    // Init segments as a chain behind head
+    for (let i = 0; i < NUM_SEGMENTS; i++) {
+      segments.push({ x: head.x - i * SEG_LEN, y: head.y });
+    }
+
+    // Init leg pairs (4 pairs = 8 legs)
+    for (let pair = 0; pair < NUM_LEGS / 2; pair++) {
+      const segIdx = 2 + pair * 3; // spread pairs along body
+      [-1, 1].forEach(side => {
+        const ax = segments[segIdx].x + side * 40;
+        const ay = segments[segIdx].y + 30;
+        feet.push({
+          anchor: { x: ax, y: ay },
+          current: { x: ax, y: ay },
+          target: { x: ax, y: ay },
+          stepping: false,
+          t: 1,
+          side: side,
+          pairIdx: pair,
+          segIdx: segIdx
+        });
+      });
+    }
+  };
+
+  // ─── DRAW ───────────────────────────────────────────────────────────────────
+  p.draw = function() {
+    p.clear();
+    p.background(10, 10, 15, 255);
+
+    slitherT += SLITHER_SPEED;
+    glowPulse = p.sin(p.frameCount * 0.05) * 0.5 + 0.5;
+
+    // ── Mouse / target tracking ──
+    const mx = p.mouseX, my = p.mouseY;
+    const moved = p.dist(mx, my, lastMouse.x, lastMouse.y);
+    if (moved > 2) { mouseIdle = 0; lastMouse.x = mx; lastMouse.y = my; }
+    else mouseIdle++;
+
+    if (mouseIdle > 90) {
+      // Circle mode
+      circleAngle += 0.018;
+      const radius = 80 + p.sin(circleAngle * 0.7) * 30;
+      target.x = mx + p.cos(circleAngle) * radius;
+      target.y = my + p.sin(circleAngle) * radius;
+    } else {
+      target.x = mx; target.y = my;
+    }
+
+    // ── Move head toward target ──
+    head.x += (target.x - head.x) * BODY_FOLLOW;
+    head.y += (target.y - head.y) * BODY_FOLLOW;
+
+    // ── IK chain update ──
+    segments[0].x = head.x;
+    segments[0].y = head.y;
+    for (let i = 1; i < NUM_SEGMENTS; i++) {
+      const prev = segments[i - 1];
+      const cur = segments[i];
+      const angle = p.atan2(cur.y - prev.y, cur.x - prev.x);
+      // slither sine offset
+      const sOff = p.sin(slitherT + i * SLITHER_FREQ) * SLITHER_AMP * (i / NUM_SEGMENTS);
+      const perpAngle = angle + p.HALF_PI;
+      cur.x = prev.x + p.cos(angle) * SEG_LEN + p.cos(perpAngle) * sOff;
+      cur.y = prev.y + p.sin(angle) * SEG_LEN + p.sin(perpAngle) * sOff;
+    }
+
+    // ── Leg anchoring update ──
+    updateFeet();
+
+    // ── Draw shadow ──
+    drawShadow();
+
+    // ── Draw legs (behind body) ──
+    drawLegs();
+
+    // ── Draw body ──
+    drawBody();
+
+    // ── Draw head ──
+    drawHead();
+  };
+
+  // ─── FEET LOGIC ─────────────────────────────────────────────────────────────
+  function updateFeet() {
+    feet.forEach((foot, fi) => {
+      const seg = segments[foot.segIdx] || segments[segments.length - 1];
+      const segAngle = getSegAngle(foot.segIdx);
+      const perp = segAngle + p.HALF_PI;
+
+      // Ideal foot position (beside the segment, slightly forward)
+      const forwardOffset = -10;
+      const sideOffset = foot.side * 38;
+      const idealX = seg.x + p.cos(perp) * sideOffset + p.cos(segAngle) * forwardOffset;
+      const idealY = seg.y + p.sin(perp) * sideOffset + p.sin(segAngle) * forwardOffset;
+
+      const distToIdeal = p.dist(foot.anchor.x, foot.anchor.y, idealX, idealY);
+
+      // Stagger steps: even/odd pairs alternate
+      const canStep = !foot.stepping &&
+        (fi % 2 === 0 ? !feet[fi + 1]?.stepping : !feet[fi - 1]?.stepping);
+
+      if (distToIdeal > STEP_DIST && canStep) {
+        // Initiate step
+        foot.stepping = true;
+        foot.t = 0;
+        foot.target.x = idealX + p.cos(segAngle) * 15;
+        foot.target.y = idealY + p.sin(segAngle) * 15;
+      }
+
+      if (foot.stepping) {
+        foot.t = p.min(foot.t + STEP_SPEED, 1);
+        // Arc the foot up while stepping
+        const lx = p.lerp(foot.anchor.x, foot.target.x, foot.t);
+        const ly = p.lerp(foot.anchor.y, foot.target.y, foot.t);
+        const arcH = -20 * p.sin(foot.t * p.PI);
+        foot.current.x = lx;
+        foot.current.y = ly + arcH;
+        if (foot.t >= 1) {
+          foot.stepping = false;
+          foot.anchor.x = foot.target.x;
+          foot.anchor.y = foot.target.y;
+          foot.current.x = foot.target.x;
+          foot.current.y = foot.target.y;
+        }
+      } else {
+        foot.current.x = foot.anchor.x;
+        foot.current.y = foot.anchor.y;
+      }
+    });
+  }
+
+  function getSegAngle(idx) {
+    const a = segments[p.max(idx - 1, 0)];
+    const b = segments[p.min(idx + 1, NUM_SEGMENTS - 1)];
+    return p.atan2(a.y - b.y, a.x - b.x);
+  }
+
+  // ─── SHADOW ─────────────────────────────────────────────────────────────────
+  function drawShadow() {
+    p.noStroke();
+    for (let i = NUM_SEGMENTS - 1; i >= 0; i--) {
+      const seg = segments[i];
+      const t = 1 - i / NUM_SEGMENTS;
+      const r = p.lerp(8, 18, t);
+      p.fill(0, 0, 0, 60);
+      p.ellipse(seg.x + 4, seg.y + 12, r * 2.5, r * 0.8);
+    }
+  }
+
+  // ─── LEGS ────────────────────────────────────────────────────────────────────
+  function drawLegs() {
+    feet.forEach(foot => {
+      const seg = segments[foot.segIdx] || segments[segments.length - 1];
+      // Knee point (midpoint with offset)
+      const segAngle = getSegAngle(foot.segIdx);
+      const perp = segAngle + p.HALF_PI;
+      const kneeX = (seg.x + foot.current.x) * 0.5 + p.cos(perp) * foot.side * 14;
+      const kneeY = (seg.y + foot.current.y) * 0.5 + p.sin(perp) * foot.side * 14;
+
+      const alpha = foot.stepping ? 255 : 200;
+
+      // Glow line
+      p.stroke(0, 220, 255, 30);
+      p.strokeWeight(6);
+      p.noFill();
+      p.beginShape();
+      p.vertex(seg.x, seg.y);
+      p.vertex(kneeX, kneeY);
+      p.vertex(foot.current.x, foot.current.y);
+      p.endShape();
+
+      // Main leg
+      p.stroke(230, 240, 255, alpha);
+      p.strokeWeight(2);
+      p.beginShape();
+      p.vertex(seg.x, seg.y);
+      p.vertex(kneeX, kneeY);
+      p.vertex(foot.current.x, foot.current.y);
+      p.endShape();
+
+      // Foot dot
+      if (foot.stepping) {
+        // Stepping: neon cyan
+        p.stroke(0, 255, 220, 255);
+        p.fill(0, 255, 220, 200);
+      } else {
+        p.stroke(180, 220, 255, 180);
+        p.fill(200, 230, 255, 160);
+      }
+      p.strokeWeight(1);
+      p.ellipse(foot.current.x, foot.current.y, 7, 7);
+    });
+  }
+
+  // ─── BODY ────────────────────────────────────────────────────────────────────
+  function drawBody() {
+    // Draw segments back to front
+    for (let i = NUM_SEGMENTS - 1; i >= 1; i--) {
+      const seg = segments[i];
+      const t = 1 - i / NUM_SEGMENTS;
+      const r = p.lerp(5, 16, t);
+
+      const angle = p.atan2(segments[i - 1].y - seg.y, segments[i - 1].x - seg.x);
+
+      // Outer glow
+      p.noStroke();
+      p.fill(0, 180, 255, 12 + glowPulse * 8);
+      p.ellipse(seg.x, seg.y, (r + 6) * 2, (r + 6) * 2);
+
+      // Segment body
+      p.stroke(0, 160, 255, 60);
+      p.strokeWeight(1);
+      p.fill(235, 240, 250, 245);
+      p.push();
+      p.translate(seg.x, seg.y);
+      p.rotate(angle);
+      p.ellipse(0, 0, r * 2.2, r * 1.7);
+      p.pop();
+
+      // Ridge line
+      if (i % 2 === 0) {
+        p.stroke(0, 200, 255, 80 + glowPulse * 40);
+        p.strokeWeight(1.5);
+        p.noFill();
+        p.push();
+        p.translate(seg.x, seg.y);
+        p.rotate(angle);
+        p.line(-r * 0.7, 0, r * 0.7, 0);
+        p.pop();
+      }
+
+      // Segment separator lines
+      p.stroke(180, 200, 230, 100);
+      p.strokeWeight(0.8);
+      p.push();
+      p.translate(seg.x, seg.y);
+      p.rotate(angle + p.HALF_PI);
+      p.line(-r * 0.9, 0, r * 0.9, 0);
+      p.pop();
+    }
+  }
+
+  // ─── HEAD ────────────────────────────────────────────────────────────────────
+  function drawHead() {
+    const seg0 = segments[0];
+    const seg1 = segments[1];
+    const angle = p.atan2(seg0.y - seg1.y, seg0.x - seg1.x);
+
+    p.push();
+    p.translate(seg0.x, seg0.y);
+    p.rotate(angle);
+
+    // Head glow halo
+    p.noStroke();
+    p.fill(255, 30, 0, 15 + glowPulse * 20);
+    p.ellipse(0, 0, 70, 55);
+
+    // Skull base
+    p.stroke(0, 150, 255, 80);
+    p.strokeWeight(1.5);
+    p.fill(240, 245, 255, 250);
+
+    // Main cranium
+    p.beginShape();
+    p.vertex(22, 0);        // snout tip
+    p.vertex(18, -10);
+    p.vertex(8, -16);
+    p.vertex(-5, -18);
+    p.vertex(-20, -14);
+    p.vertex(-26, -6);
+    p.vertex(-26, 6);
+    p.vertex(-20, 14);
+    p.vertex(-5, 18);
+    p.vertex(8, 16);
+    p.vertex(18, 10);
+    p.endShape(p.CLOSE);
+
+    // Lower jaw
+    p.fill(225, 232, 245, 230);
+    p.beginShape();
+    p.vertex(22, 0);
+    p.vertex(16, 8);
+    p.vertex(6, 12);
+    p.vertex(-8, 12);
+    p.vertex(-18, 7);
+    p.vertex(-18, 0);
+    p.vertex(-8, -3);
+    p.vertex(6, -3);
+    p.endShape(p.CLOSE);
+
+    // Brow ridge
+    p.stroke(0, 180, 255, 120);
+    p.strokeWeight(2);
+    p.noFill();
+    p.beginShape();
+    p.vertex(-5, -18);
+    p.vertex(8, -14);
+    p.vertex(18, -8);
+    p.endShape();
+
+    // Cheekbone plates
+    p.stroke(0, 160, 255, 90);
+    p.strokeWeight(1);
+    p.fill(215, 225, 245, 200);
+    p.quad(-20, -14, -12, -18, -6, -14, -14, -10);
+
+    // Nostril slits
+    p.fill(30, 40, 60, 200);
+    p.noStroke();
+    p.ellipse(17, -3, 4, 2);
+    p.ellipse(17, 3, 4, 2);
+
+    // Neon teeth
+    p.stroke(0, 220, 255, 200);
+    p.strokeWeight(1.2);
+    p.fill(200, 255, 250, 240);
+    [-6, -1, 4].forEach((ty, i) => {
+      p.triangle(20 + i, ty, 24 + i * 0.3, ty - 2, 24 + i * 0.3, ty + 2);
+    });
+
+    // ── Eyes ──
+    const eyeOffY = 9;
+    [-1, 1].forEach(side => {
+      const ex = 4, ey = side * eyeOffY;
+
+      // Eye socket
+      p.noStroke();
+      p.fill(10, 8, 20, 220);
+      p.ellipse(ex, ey, 13, 10);
+
+      // Glow aura
+      p.fill(255, 0, 0, 30 + glowPulse * 50);
+      p.ellipse(ex, ey, 20, 16);
+
+      // Iris
+      p.fill(255, 20, 0, 230);
+      p.ellipse(ex, ey, 9, 7);
+
+      // Pupil (vertical slit)
+      p.fill(5, 0, 0, 255);
+      p.ellipse(ex, ey, 3, 7);
+
+      // Eye shine
+      p.fill(255, 100, 80, 200);
+      p.ellipse(ex + 2, ey - 2, 3, 2);
+
+      // Eye rim
+      p.noFill();
+      p.stroke(255, 60, 0, 180 + glowPulse * 60);
+      p.strokeWeight(1.2);
+      p.ellipse(ex, ey, 13, 10);
+    });
+
+    // Cranial neon ridge line
+    p.noFill();
+    p.stroke(0, 200, 255, 140 + glowPulse * 80);
+    p.strokeWeight(1.5);
+    p.beginShape();
+    p.vertex(-20, -14); p.vertex(-10, -17); p.vertex(0, -16); p.vertex(10, -13);
+    p.endShape();
+
+    p.pop();
+  }
+
+  p.windowResized = function() {
+    p.resizeCanvas(p.windowWidth, p.windowHeight);
+  };
+});
+</script>
+</body>
+</html>
